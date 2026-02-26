@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  telegram-bot-starter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-bot-starter-dev
+    stdin_open: true
+    tty: true
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - SESSION_PATH=/app/session/telegram-session.json
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-100}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-300000}
+      - NODE_ENV=development
+    volumes:
+      - ./session:/app/session
+      - ./src:/app/src
+      - ./package.json:/app/package.json
+    command: node src/index.js
+    restart: unless-stopped

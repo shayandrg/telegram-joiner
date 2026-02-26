@@ -1,0 +1,24 @@
+services:
+  app:
+    image: shayandrg/telegram-joiner:latest
+    container_name: telegram-joiner-prod
+    stdin_open: true
+    tty: true
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - SESSION_PATH=/app/session/telegram-session.json
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - MAX_QUEUE_SIZE=${MAX_QUEUE_SIZE:-100}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-300000}
+      - NODE_ENV=production
+    volumes:
+      - ./session:/app/session
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,15 @@
+node_modules
+npm-debug.log
+session/
+.git
+.gitignore
+README.md
+tests/
+.env
+.env.example
+docker-compose.yml
+docker-compose.prod.yml
+Dockerfile
+Dockerfile.prod
+.dockerignore
+.kiro/

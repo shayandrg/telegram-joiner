@@ -1,0 +1,60 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Docker Image"]
+    types:
+      - completed
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare app directory on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: mkdir -p /srv/telegram-joiner
+
+      - name: Copy docker-compose file to VPS
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.prod.yml"
+          target: "/srv/telegram-joiner"
+
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            cd /srv/telegram-joiner
+
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+            export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            export TELEGRAM_API_ID="${{ secrets.TELEGRAM_API_ID }}"
+            export TELEGRAM_API_HASH="${{ secrets.TELEGRAM_API_HASH }}"
+            export TELEGRAM_BOT_TOKEN="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+            export TELEGRAM_PHONE="${{ secrets.TELEGRAM_PHONE }}"
+            export LOG_LEVEL="${{ secrets.LOG_LEVEL }}"
+
+            docker compose -p telegram-joiner -f docker-compose.prod.yml down
+            docker pull ${DOCKERHUB_USERNAME}/telegram-joiner:latest
+            docker compose -p telegram-joiner -f docker-compose.prod.yml up -d
+
+            docker image prune -f
