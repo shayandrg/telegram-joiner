@@ -46,6 +46,11 @@ jobs:
 
             echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
+            # Create session directory with proper permissions
+            mkdir -p session
+            chown -R 1001:1001 session
+            chmod -R 700 session
+
             export DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
             export TELEGRAM_API_ID="${{ secrets.TELEGRAM_API_ID }}"
             export TELEGRAM_API_HASH="${{ secrets.TELEGRAM_API_HASH }}"
