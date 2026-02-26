@@ -206,9 +206,13 @@ class BotInteractionHandler extends EventEmitter {
       }
       
       await this.joinChannelFromUrl(client, button.url, button.text);
-      // Small delay between joins
-      await this.sleep(1000);
+      // Increased delay between joins to ensure they complete
+      await this.sleep(2000);
     }
+    
+    // Additional delay after all joins to ensure they're processed
+    this.logger.log('INFO', 'Waiting for channel joins to be fully processed...');
+    await this.sleep(3000);
   }
 
   async joinChannelFromUrl(client, url, buttonText) {
@@ -218,7 +222,7 @@ class BotInteractionHandler extends EventEmitter {
       const match = url.match(/t\.me\/([^?]+)/);
       if (!match) {
         this.logger.log('WARN', `Could not parse channel URL: ${url}`);
-        return;
+        return false;
       }
 
       const channelIdentifier = match[1];
@@ -235,6 +239,7 @@ class BotInteractionHandler extends EventEmitter {
         );
         
         this.logger.log('INFO', `✅ Joined channel via invite: ${buttonText}`);
+        return true;
       } else {
         // Regular channel username
         this.logger.log('INFO', `Joining channel: ${channelIdentifier}`);
@@ -253,10 +258,18 @@ class BotInteractionHandler extends EventEmitter {
           );
           
           this.logger.log('INFO', `✅ Joined channel: ${buttonText} (@${channelIdentifier})`);
+          return true;
         }
       }
+      return false;
     } catch (error) {
+      // Check if already a member
+      if (error.message && error.message.includes('USER_ALREADY_PARTICIPANT')) {
+        this.logger.log('INFO', `ℹ️ Already a member of channel: ${buttonText}`);
+        return true;
+      }
       this.logger.log('ERROR', `Failed to join channel from ${url}: ${error.message}`);
+      return false;
     }
   }
 
@@ -317,16 +330,17 @@ class BotInteractionHandler extends EventEmitter {
       }
     }
 
-    // Wait and collect media messages from bot
-    await this.waitAndForwardMediaMessages(client, bot, originalSenderId, botChatId);
+    // Wait and collect media messages from bot, with retry logic for channel join requests
+    await this.waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId);
   }
 
-  async waitAndForwardMediaMessages(client, bot, originalSenderId, botChatId = null) {
+  async waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId = null) {
     return new Promise((resolve) => {
       const mediaMessages = [];
       let lastMessageTime = Date.now();
       const mediaTimeout = 10000; // 10 seconds after last media message
       let mediaCount = 0;
+      let retryAttempted = false;
       
       const checkTimeout = setInterval(() => {
         if (Date.now() - lastMessageTime > mediaTimeout) {
@@ -343,9 +357,46 @@ class BotInteractionHandler extends EventEmitter {
           
           // Check if message is from the bot
           if (message.senderId?.toString() === bot.id.toString()) {
+            lastMessageTime = Date.now();
+            
+            // Check if bot is sending join links again (retry scenario)
+            if (!retryAttempted && message.replyMarkup && message.replyMarkup.rows) {
+              this.logger.log('WARN', '⚠️ Bot sent join links again - channels may not have been joined properly');
+              retryAttempted = true;
+              
+              // Re-join channels from the new message
+              await this.joinChannelsFromButtons(client, message.replyMarkup, botChatId);
+              
+              // Click the confirm button again
+              const lastRow = message.replyMarkup.rows[message.replyMarkup.rows.length - 1];
+              const confirmButton = lastRow.buttons[0];
+              
+              this.logger.log('INFO', `Re-clicking confirm button: ${confirmButton.text}`);
+              
+              try {
+                await client.invoke(
+                  new Api.messages.GetBotCallbackAnswer({
+                    peer: bot,
+                    msgId: message.id,
+                    data: confirmButton.data
+                  })
+                );
+                this.logger.log('INFO', `✅ Confirm button re-clicked successfully`);
+              } catch (error) {
+                if (error.message && error.message.includes('BOT_RESPONSE_TIMEOUT')) {
+                  this.logger.log('INFO', `✅ Confirm button re-clicked (timeout expected)`);
+                } else {
+                  this.logger.log('WARN', `Button re-click warning: ${error.message}`);
+                }
+              }
+              
+              // Reset timeout to wait for media after retry
+              lastMessageTime = Date.now();
+              return;
+            }
+            
             // Check if message has media (photo or video)
             if (message.photo || message.video || message.document) {
-              lastMessageTime = Date.now();
               mediaMessages.push(message);
               mediaCount++;
               
@@ -379,6 +430,11 @@ class BotInteractionHandler extends EventEmitter {
       const { NewMessage } = require('telegram/events');
       client.addEventHandler(handler, new NewMessage({}));
     });
+  }
+
+  async waitAndForwardMediaMessages(client, bot, originalSenderId, botChatId = null) {
+    // Redirect to the retry-enabled version
+    return this.waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId);
   }
 
   async forwardMessageToUser(client, message, userId) {
