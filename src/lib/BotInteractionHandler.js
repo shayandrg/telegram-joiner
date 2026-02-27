@@ -1,5 +1,6 @@
 const { Api } = require('telegram');
 const EventEmitter = require('events');
+const { formatWaitTime } = require('../utils/TimeFormatter');
 
 class BotInteractionHandler extends EventEmitter {
   constructor(logger) {
@@ -23,20 +24,44 @@ class BotInteractionHandler extends EventEmitter {
         };
       }
 
+      // Start media collection BEFORE sending start command to catch all messages
+      this.logger.log('INFO', 'Starting media listener before sending start command...');
+      const mediaCollectionPromise = this.waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId);
+      
+      // Small delay to ensure handler is registered
+      await new Promise(resolve => setImmediate(resolve));
+
       // Send start command with parameter
       const startCommand = `/start ${link.startParameter}`;
       await this.sendStartCommand(client, bot, startCommand);
 
-      // Wait for bot response with buttons
+      // Wait for bot response with buttons (this will be caught by media handler too)
       const responseMessage = await this.waitForResponseMessage(client, bot);
 
       if (!responseMessage) {
+        // No initial response, but media might still be coming
+        // Wait for media collection to complete before deciding if it's an error
+        this.logger.log('WARN', 'No initial response message, but waiting for media collection...');
+        const mediaResult = await mediaCollectionPromise;
+        
+        if (mediaResult && mediaResult.mediaCount > 0) {
+          // Media was received, so it's actually successful
+          return {
+            botUsername: link.botUsername,
+            responseText: `Media forwarded (${mediaResult.mediaCount} file(s))`,
+            timestamp: new Date(),
+            success: true
+          };
+        }
+        
+        // No response and no media - return error
         return {
           botUsername: link.botUsername,
-          responseText: 'No response received',
+          
+          responseText: '',
           timestamp: new Date(),
           success: false,
-          error: 'No response received'
+          error: 'Bot response timeout - no message received'
         };
       }
 
@@ -45,10 +70,43 @@ class BotInteractionHandler extends EventEmitter {
         this.logger.log('INFO', 'Bot response has inline keyboard buttons');
         
         // Extract channel links and join them
-        await this.joinChannelsFromButtons(client, responseMessage.replyMarkup, botChatId);
+        const joinResult = await this.joinChannelsFromButtons(client, responseMessage.replyMarkup, botChatId);
         
-        // Click the last button (confirm button) and forward media
-        await this.clickConfirmButtonAndForwardMedia(client, bot, responseMessage, originalSenderId, botChatId);
+        // Check if we hit rate limit
+        if (joinResult && !joinResult.success && joinResult.floodWait > 0) {
+          return {
+            botUsername: link.botUsername,
+            responseText: `Rate limited: Please wait ${formatWaitTime(joinResult.floodWait)}. Joined ${joinResult.joinedCount} channels.`,
+            timestamp: new Date(),
+            success: false,
+            error: `FLOOD_WAIT: ${formatWaitTime(joinResult.floodWait)}`,
+            floodWait: joinResult.floodWait
+          };
+        }
+        
+        // Click the last button (confirm button) - media handler is already running
+        const callbackResult = await this.clickConfirmButton(client, bot, responseMessage);
+        
+        // Check if callback returned a popup alert about joining channels
+        if (callbackResult && callbackResult.alert) {
+          this.logger.log('WARN', `⚠️ Bot sent popup alert: ${callbackResult.message}`);
+          
+          // If popup says we need to join channels, wait longer and retry
+          if (callbackResult.message && 
+              (callbackResult.message.includes('join') || 
+               callbackResult.message.includes('عضو') || 
+               callbackResult.message.includes('subscribe'))) {
+            this.logger.log('INFO', 'Waiting additional time for channel joins to process...');
+            await this.sleep(5000);
+            
+            // Retry clicking the confirm button
+            this.logger.log('INFO', 'Retrying confirm button click...');
+            await this.clickConfirmButton(client, bot, responseMessage);
+          }
+        }
+        
+        // Wait for media collection to complete
+        await mediaCollectionPromise;
         
         return {
           botUsername: link.botUsername,
@@ -58,9 +116,9 @@ class BotInteractionHandler extends EventEmitter {
         };
       }
 
-      // No buttons - bot is sending media directly, just wait and forward
-      this.logger.log('INFO', 'No inline keyboard buttons, waiting for media messages...');
-      await this.waitAndForwardMediaMessages(client, bot, originalSenderId, botChatId);
+      // No buttons - bot is sending media directly, media handler is already running
+      this.logger.log('INFO', 'No inline keyboard buttons, media handler already active...');
+      await mediaCollectionPromise;
 
       return {
         botUsername: link.botUsername,
@@ -192,6 +250,10 @@ class BotInteractionHandler extends EventEmitter {
     const totalChannels = channelButtons.length;
     this.logger.log('INFO', `Found ${totalChannels} channel buttons to join`);
 
+    let successCount = 0;
+    let floodWaitDetected = false;
+    let maxFloodWait = 0;
+
     // Join each channel
     for (let i = 0; i < channelButtons.length; i++) {
       const button = channelButtons[i];
@@ -205,14 +267,45 @@ class BotInteractionHandler extends EventEmitter {
         });
       }
       
-      await this.joinChannelFromUrl(client, button.url, button.text);
-      // Increased delay between joins to ensure they complete
-      await this.sleep(2000);
+      const result = await this.joinChannelFromUrl(client, button.url, button.text);
+      
+      if (result.success) {
+        successCount++;
+      }
+      
+      if (result.floodWait > 0) {
+        floodWaitDetected = true;
+        maxFloodWait = Math.max(maxFloodWait, result.floodWait);
+        this.logger.log('WARN', `⚠️ Stopping channel joins due to rate limit (${formatWaitTime(result.floodWait)} wait required)`);
+        break; // Stop trying to join more channels
+      }
+      
+      // Increased delay between joins to avoid rate limits
+      await this.sleep(3000);
     }
     
-    // Additional delay after all joins to ensure they're processed
-    this.logger.log('INFO', 'Waiting for channel joins to be fully processed...');
-    await this.sleep(3000);
+    this.logger.log('INFO', `Successfully joined ${successCount}/${totalChannels} channels`);
+    
+    if (floodWaitDetected) {
+      this.logger.log('INFO', `📊 Raw Telegram flood wait value: ${maxFloodWait} seconds`);
+      this.logger.log('WARN', `⚠️ Telegram rate limit reached. Please wait ${formatWaitTime(maxFloodWait)} before trying again.`);
+      // Emit flood wait event
+      if (botChatId) {
+        this.emit('floodWait', {
+          chatId: botChatId,
+          waitSeconds: maxFloodWait,
+          joinedCount: successCount,
+          totalCount: totalChannels
+        });
+      }
+      return { success: false, floodWait: maxFloodWait, joinedCount: successCount };
+    }
+    
+    // Additional delay after all joins to ensure they're processed by Telegram servers
+    this.logger.log('INFO', 'Waiting for channel joins to be fully processed by Telegram...');
+    await this.sleep(5000);
+    
+    return { success: true, floodWait: 0, joinedCount: successCount };
   }
 
   async joinChannelFromUrl(client, url, buttonText) {
@@ -222,7 +315,7 @@ class BotInteractionHandler extends EventEmitter {
       const match = url.match(/t\.me\/([^?]+)/);
       if (!match) {
         this.logger.log('WARN', `Could not parse channel URL: ${url}`);
-        return false;
+        return { success: false, floodWait: 0 };
       }
 
       const channelIdentifier = match[1];
@@ -239,7 +332,7 @@ class BotInteractionHandler extends EventEmitter {
         );
         
         this.logger.log('INFO', `✅ Joined channel via invite: ${buttonText}`);
-        return true;
+        return { success: true, floodWait: 0 };
       } else {
         // Regular channel username
         this.logger.log('INFO', `Joining channel: ${channelIdentifier}`);
@@ -258,18 +351,28 @@ class BotInteractionHandler extends EventEmitter {
           );
           
           this.logger.log('INFO', `✅ Joined channel: ${buttonText} (@${channelIdentifier})`);
-          return true;
+          return { success: true, floodWait: 0 };
         }
       }
-      return false;
+      return { success: false, floodWait: 0 };
     } catch (error) {
       // Check if already a member
       if (error.message && error.message.includes('USER_ALREADY_PARTICIPANT')) {
         this.logger.log('INFO', `ℹ️ Already a member of channel: ${buttonText}`);
-        return true;
+        return { success: true, floodWait: 0 };
       }
+      
+      // Check for flood wait error
+      if (error.message && error.message.includes('A wait of')) {
+        const waitMatch = error.message.match(/A wait of (\d+) seconds/);
+        const waitSeconds = waitMatch ? parseInt(waitMatch[1]) : 0;
+        this.logger.log('INFO', `📊 Raw Telegram flood wait value: ${waitSeconds} seconds`);
+        this.logger.log('WARN', `⏳ Telegram rate limit: Must wait ${formatWaitTime(waitSeconds)} before joining more channels`);
+        return { success: false, floodWait: waitSeconds };
+      }
+      
       this.logger.log('ERROR', `Failed to join channel from ${url}: ${error.message}`);
-      return false;
+      return { success: false, floodWait: 0 };
     }
   }
 
@@ -282,7 +385,7 @@ class BotInteractionHandler extends EventEmitter {
       this.logger.log('INFO', `Clicking confirm button: ${confirmButton.text}`);
 
       // Click the button by sending callback query
-      await client.invoke(
+      const callbackAnswer = await client.invoke(
         new Api.messages.GetBotCallbackAnswer({
           peer: bot,
           msgId: originalMessage.id,
@@ -290,13 +393,24 @@ class BotInteractionHandler extends EventEmitter {
         })
       );
 
-      // Wait for the final response
-      const finalResponse = await this.waitForResponse(client, bot);
+      // Check if bot sent a popup alert
+      if (callbackAnswer.alert) {
+        this.logger.log('WARN', `⚠️ Bot popup alert: ${callbackAnswer.message}`);
+        return { alert: true, message: callbackAnswer.message };
+      }
+
+      if (callbackAnswer.message) {
+        this.logger.log('INFO', `Bot callback response: ${callbackAnswer.message}`);
+      }
       
-      this.logger.log('INFO', `✅ Confirm button clicked, received final response`);
+      this.logger.log('INFO', `✅ Confirm button clicked successfully`);
       
-      return finalResponse;
+      return { alert: false, message: callbackAnswer.message };
     } catch (error) {
+      if (error.message && error.message.includes('BOT_RESPONSE_TIMEOUT')) {
+        this.logger.log('INFO', `✅ Confirm button clicked (timeout expected, bot will send media)`);
+        return { alert: false };
+      }
       this.logger.log('ERROR', `Failed to click confirm button: ${error.message}`);
       return null;
     }
@@ -309,10 +423,14 @@ class BotInteractionHandler extends EventEmitter {
 
     this.logger.log('INFO', `Clicking confirm button: ${confirmButton.text}`);
 
+    // Start listening for media BEFORE clicking the button
+    const mediaPromise = this.waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId);
+
+    // Give a tiny delay to ensure event handler is registered
+    await new Promise(resolve => setImmediate(resolve));
+
     try {
       // Click the button by sending callback query
-      // Note: This often times out because the bot doesn't respond to the callback,
-      // it just starts sending media messages instead
       await client.invoke(
         new Api.messages.GetBotCallbackAnswer({
           peer: bot,
@@ -322,7 +440,6 @@ class BotInteractionHandler extends EventEmitter {
       );
       this.logger.log('INFO', `✅ Confirm button clicked`);
     } catch (error) {
-      // Ignore BOT_RESPONSE_TIMEOUT - it's expected behavior
       if (error.message && error.message.includes('BOT_RESPONSE_TIMEOUT')) {
         this.logger.log('INFO', `✅ Confirm button clicked (bot didn't respond to callback, will send media)`);
       } else {
@@ -330,33 +447,48 @@ class BotInteractionHandler extends EventEmitter {
       }
     }
 
-    // Wait and collect media messages from bot, with retry logic for channel join requests
-    await this.waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId);
+    // Wait for media collection to complete
+    await mediaPromise;
   }
 
   async waitAndForwardMediaMessagesWithRetry(client, bot, originalSenderId, botChatId = null) {
+    this.logger.log('INFO', `Starting media collection for bot: ${bot.id?.toString() || 'unknown'}`);
+    this.logger.log('DEBUG', `Bot object type: ${typeof bot}, has id: ${!!bot.id}`);
+    
     return new Promise((resolve) => {
       const mediaMessages = [];
       let lastMessageTime = Date.now();
-      const mediaTimeout = 60000; // 60 seconds after last media message
+      const mediaTimeout = 10000; // 10 seconds after last media message
       let mediaCount = 0;
       let retryAttempted = false;
+      let totalMessagesReceived = 0;
       
       const checkTimeout = setInterval(() => {
         if (Date.now() - lastMessageTime > mediaTimeout) {
           clearInterval(checkTimeout);
           client.removeEventHandler(handler);
-          this.logger.log('INFO', `Collected ${mediaMessages.length} media messages`);
-          resolve();
+          this.logger.log('INFO', `Media collection complete: ${mediaMessages.length} media messages collected from ${totalMessagesReceived} total messages`);
+          resolve({ mediaCount: mediaMessages.length, totalMessages: totalMessagesReceived });
         }
       }, 1000);
 
       const handler = async (event) => {
         try {
           const message = event.message;
+          totalMessagesReceived++;
           
-          // Check if message is from the bot
-          if (message.senderId?.toString() === bot.id.toString()) {
+          const messageSenderId = message.senderId?.toString();
+          const botId = bot.id?.toString();
+          
+          this.logger.log('DEBUG', `[${totalMessagesReceived}] Message from ${messageSenderId}, expecting ${botId}`);
+          
+          // Check if message is from the bot (handle both string and BigInt IDs)
+          const isFromBot = messageSenderId === botId || 
+                           message.senderId?.value?.toString() === botId ||
+                           message.peerId?.userId?.toString() === botId;
+          
+          if (isFromBot) {
+            this.logger.log('DEBUG', `[${totalMessagesReceived}] ✓ From target bot - photo: ${!!message.photo}, video: ${!!message.video}, document: ${!!message.document}`);
             lastMessageTime = Date.now();
             
             // Check if bot is sending join links again (retry scenario)
@@ -395,13 +527,19 @@ class BotInteractionHandler extends EventEmitter {
               return;
             }
             
-            // Check if message has media (photo or video)
+            // Check if message has media (photo, video, or document)
             if (message.photo || message.video || message.document) {
+              // Check if this is part of a media group/album
+              const groupedId = message.groupedId?.toString();
+              if (groupedId) {
+                this.logger.log('DEBUG', `Media is part of group: ${groupedId}`);
+              }
+              
               mediaMessages.push(message);
               mediaCount++;
               
               const mediaType = message.photo ? 'photo' : message.video ? 'video' : 'document';
-              this.logger.log('INFO', `📥 Received ${mediaType} from bot (${mediaCount} total)`);
+              this.logger.log('INFO', `📥 Received ${mediaType} from bot (${mediaCount} total)${groupedId ? ` [group: ${groupedId}]` : ''}`);
               
               // Emit progress event
               if (botChatId) {
@@ -420,6 +558,8 @@ class BotInteractionHandler extends EventEmitter {
                 // Direct forward to user
                 await this.forwardMessageToUser(client, message, originalSenderId);
               }
+            } else {
+              this.logger.log('DEBUG', `Message from bot has no media - text: "${message.text?.substring(0, 50) || 'none'}"`);
             }
           }
         } catch (error) {
@@ -428,7 +568,9 @@ class BotInteractionHandler extends EventEmitter {
       };
 
       const { NewMessage } = require('telegram/events');
+      this.logger.log('INFO', `Registering media event handler for bot ${bot.id.toString()}`);
       client.addEventHandler(handler, new NewMessage({}));
+      this.logger.log('INFO', `Media event handler registered, waiting for media messages...`);
     });
   }
 

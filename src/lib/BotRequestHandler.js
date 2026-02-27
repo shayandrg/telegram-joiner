@@ -1,3 +1,5 @@
+const { formatWaitTime } = require('../utils/TimeFormatter');
+
 class BotRequestHandler {
   constructor(client, botInteractionHandler, telegramBot, requestTracker, logger) {
     this.client = client;
@@ -40,9 +42,23 @@ class BotRequestHandler {
         }
       };
 
+      const floodWaitHandler = (data) => {
+        if (data.chatId === request.chatId) {
+          this.updateStatus(
+            request.chatId, 
+            `⏳ Telegram rate limit reached!\n\n` +
+            `Joined ${data.joinedCount}/${data.totalCount} channels.\n` +
+            `Please wait ${formatWaitTime(data.waitSeconds)} before trying again.`
+          );
+        }
+      };
+
       this.botInteractionHandler.on('channelProgress', channelProgressHandler);
       this.botInteractionHandler.on('mediaProgress', mediaProgressHandler);
       this.botInteractionHandler.on('mediaReceived', mediaReceivedHandler);
+      this.botInteractionHandler.on('floodWait', floodWaitHandler);
+
+      let rateLimitHit = false;
 
       // Process each bot link
       for (let i = 0; i < request.botLinks.length; i++) {
@@ -66,24 +82,40 @@ class BotRequestHandler {
         );
 
         if (!response.success) {
-          await this.sendErrorMessage(request.chatId, link.botUsername, response.error);
+          // Check if it's a flood wait error
+          if (response.floodWait) {
+            rateLimitHit = true;
+            await this.updateStatus(
+              request.chatId,
+              `⏳ Telegram rate limit reached!\n\n` +
+              `Please wait ${formatWaitTime(response.floodWait)} before trying again.`
+            );
+            // Don't process remaining links
+            break;
+          } else {
+            await this.sendErrorMessage(request.chatId, link.botUsername, response.error);
+          }
         }
       }
 
-      // Wait for all media forwards to complete
-      if (this.pendingMediaForwards.length > 0) {
-        this.logger.log('INFO', `Waiting for ${this.pendingMediaForwards.length} media forwards to complete...`);
-        await this.updateStatus(request.chatId, `📤 Forwarding ${this.pendingMediaForwards.length} file(s)...`);
-        await Promise.all(this.pendingMediaForwards);
-      }
+      // Only send completion message if no rate limit was hit
+      if (!rateLimitHit) {
+        // Wait for all media forwards to complete
+        if (this.pendingMediaForwards.length > 0) {
+          this.logger.log('INFO', `Waiting for ${this.pendingMediaForwards.length} media forwards to complete...`);
+          await this.updateStatus(request.chatId, `📤 Forwarding ${this.pendingMediaForwards.length} file(s)...`);
+          await Promise.all(this.pendingMediaForwards);
+        }
 
-      // Send completion message
-      await this.updateStatus(request.chatId, `✅ Done! Forwarded ${this.pendingMediaForwards.length} file(s).`);
+        // Send completion message
+        await this.updateStatus(request.chatId, `✅ Done! Forwarded ${this.pendingMediaForwards.length} file(s).`);
+      }
 
       // Clean up event listeners
       this.botInteractionHandler.off('channelProgress', channelProgressHandler);
       this.botInteractionHandler.off('mediaProgress', mediaProgressHandler);
       this.botInteractionHandler.off('mediaReceived', mediaReceivedHandler);
+      this.botInteractionHandler.off('floodWait', floodWaitHandler);
 
     } catch (error) {
       this.logger.log('ERROR', `Error handling request: ${error.message}`);
@@ -152,18 +184,20 @@ class BotRequestHandler {
         return;
       }
 
-      // Forward message from target bot to our bot account using client
+      // Forward message but drop caption
       await this.client.forwardMessages(botEntity.users[0], {
         messages: [message.id],
-        fromPeer: message.peerId
+        fromPeer: message.peerId,
+        dropCaption: true
       });
       
       const mediaType = message.photo ? 'photo' : message.video ? 'video' : 'document';
-      this.logger.log('INFO', `📤 Forwarded ${mediaType} to bot account @${botAccount.username}`);
+      this.logger.log('INFO', `📤 Forwarded ${mediaType} to bot account @${botAccount.username} without caption`);
     } catch (error) {
       this.logger.log('ERROR', `Failed to forward media to bot account: ${error.message}`);
     }
   }
+
 
   onChannelsJoining(chatId) {
     this.sendStatusUpdate(chatId, '🔗 Joining required channels...');

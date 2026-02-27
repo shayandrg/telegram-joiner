@@ -8,7 +8,7 @@ class TelegramBot extends EventEmitter {
     this.linkParser = linkParser;
     this.logger = logger;
     this.bot = null;
-    this.pendingRequests = new Map();
+    this.processedMessages = new Set(); // Track processed message IDs
   }
 
   async start() {
@@ -32,32 +32,46 @@ class TelegramBot extends EventEmitter {
   }
 
   setupHandlers() {
-    // Handle /start command
-    this.bot.onText(/\/start/, async (msg) => {
-      await this.handleStartCommand(msg);
+    // Handle /start command (only at the beginning of the message)
+    this.bot.onText(/^\/start(@\w+)?(\s+(.+))?$/, async (msg, match) => {
+      await this.handleStartCommand(msg, match);
     });
 
-    // Handle /help command
-    this.bot.onText(/\/help/, async (msg) => {
+    // Handle /help command (only at the beginning of the message)
+    this.bot.onText(/^\/help(@\w+)?(\s|$)/, async (msg) => {
       await this.handleHelpCommand(msg);
-    });
-
-    // Handle callback queries (button clicks)
-    this.bot.on('callback_query', async (query) => {
-      await this.handleCallbackQuery(query);
     });
 
     // Handle all other messages
     this.bot.on('message', async (msg) => {
+      // Check if this is a forwarded message to bot account FIRST
+      // This prevents forwarded media from being processed as new requests
+      if (msg.forward_from) {
+        await this.handleForwardedMessage(msg);
+        return;
+      }
+
       // Skip if it's a command
       if (msg.text && msg.text.startsWith('/')) {
         return;
       }
 
-      // Check if this is a forwarded message to bot account
-      if (msg.forward_from) {
-        await this.handleForwardedMessage(msg);
+      // Skip messages from the bot itself to prevent processing own status messages
+      if (msg.from && msg.from.is_bot) {
         return;
+      }
+
+      // Handle media groups: Only process the first message with caption/entities
+      // Skip subsequent messages in the same media group that don't have caption
+      if (msg.media_group_id) {
+        const hasCaption = !!(msg.caption || msg.text);
+        const hasEntities = !!(msg.caption_entities || msg.entities);
+        
+        // Only process if it has caption or entities (first message in group)
+        if (!hasCaption && !hasEntities) {
+          this.logger.log('DEBUG', `Skipping media group message ${msg.message_id} without caption`);
+          return;
+        }
       }
 
       await this.handleMessage(msg);
@@ -69,8 +83,57 @@ class TelegramBot extends EventEmitter {
     });
   }
 
-  async handleStartCommand(msg) {
+  async handleStartCommand(msg, match) {
     const chatId = msg.chat.id;
+    const isPrivateChat = msg.chat.type === 'private';
+    
+    // Check if there's a parameter (deep link data)
+    const startParam = match && match[3] ? match[3].trim() : null;
+    
+    if (startParam && isPrivateChat) {
+      // User came from group via deep link - decode and process links
+      try {
+        const decodedData = this.decodeStartParameter(startParam);
+        
+        if (decodedData && decodedData.links && decodedData.links.length > 0) {
+          this.logger.log('INFO', `Processing ${decodedData.links.length} link(s) from deep link parameter`);
+          
+          // Create request object
+          const request = {
+            chatId: chatId,
+            userId: msg.from.id,
+            username: msg.from.username || 'unknown',
+            botLinks: decodedData.links,
+            timestamp: new Date(),
+            status: 'queued',
+            timeout: 300000 // 5 minutes
+          };
+          
+          // Emit request received event
+          this.emit('requestReceived', request);
+          return;
+        } else {
+          this.logger.log('WARN', `Failed to decode start parameter: ${startParam}`);
+          // Send error message to user
+          await this.bot.sendMessage(
+            chatId,
+            '❌ Invalid or expired link. Please try getting a new link from the group.',
+            { parse_mode: 'Markdown' }
+          );
+          return;
+        }
+      } catch (error) {
+        this.logger.log('ERROR', `Error decoding start parameter: ${error.message}`);
+        await this.bot.sendMessage(
+          chatId,
+          '❌ An error occurred while processing the link. Please try again.',
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+    }
+    
+    // Default welcome message
     const welcomeText = `
 🤖 *Welcome to Bot Link Processor!*
 
@@ -135,6 +198,27 @@ Happy downloading! 🎉
   }
 
   async handleMessage(msg) {
+    // console.log('handleMessage, msg:', msg)
+    // Prevent duplicate processing of the same message
+    const messageKey = `${msg.chat.id}_${msg.message_id}`;
+    if (this.processedMessages.has(messageKey)) {
+      this.logger.log('DEBUG', `Skipping duplicate message ${msg.message_id}`);
+      return;
+    }
+    this.processedMessages.add(messageKey);
+    
+    // Clean up old message IDs (keep only last 100)
+    if (this.processedMessages.size > 100) {
+      const entries = Array.from(this.processedMessages);
+      this.processedMessages = new Set(entries.slice(-100));
+    }
+
+    // Safety check: Skip forwarded messages (should be handled by handleForwardedMessage)
+    if (msg.forward_from) {
+      this.logger.log('WARN', 'Forwarded message reached handleMessage - this should not happen');
+      return;
+    }
+
     const chatId = msg.chat.id;
     const isPrivateChat = msg.chat.type === 'private';
     
@@ -145,22 +229,12 @@ Happy downloading! 🎉
     // Log the entire message for debugging
     this.logger.log('INFO', `Bot received message type: ${msg.photo ? 'photo' : msg.video ? 'video' : 'text'} in ${msg.chat.type} chat`);
 
-    // Extract URLs from message entities (hidden links)
-    const entityUrls = this.extractUrlsFromEntities(text, entities);
-    
-    // Extract bot links from plain text
-    const textBotLinks = this.linkParser.extractBotLinks(text);
-    
-    // Extract bot links from entities
-    const entityBotLinks = this.linkParser.extractBotLinks(entityUrls.join(' '));
-    
-    // Combine and deduplicate
-    const allBotLinks = [...textBotLinks, ...entityBotLinks];
-    const botLinks = this.deduplicateLinks(allBotLinks);
+    // Extract bot links from both text and entities
+    const botLinks = this.linkParser.extractBotLinks(text, entities);
 
-    this.logger.log('INFO', `Text bot links: ${textBotLinks.length}, Entity bot links: ${entityBotLinks.length}, Total unique: ${botLinks.length}`);
+    this.logger.log('INFO', `Found ${botLinks.length} bot link(s) in message`);
 
-    if (botLinks.length === 0) {
+    if (botLinks?.length === 0) {
       // Only send "no links found" message in private chats, ignore in groups
       if (isPrivateChat) {
         const noLinksText = `
@@ -181,46 +255,49 @@ Use /help for more information.
       return;
     }
 
-    // In group chats, send a button instead of processing immediately
+    // In group chats, send a button with deep link to bot instead of processing immediately
     if (!isPrivateChat) {
       try {
+        // Get bot info to create deep link
+        const botInfo = await this.getBotInfo();
+        if (!botInfo || !botInfo.username) {
+          this.logger.log('ERROR', 'Failed to get bot username for deep link');
+          return;
+        }
+        
+        // Encode the links into a start parameter
+        const startParam = this.encodeLinksToParameter(botLinks);
+        if (!startParam) {
+          this.logger.log('ERROR', 'Failed to encode links to parameter');
+          await this.bot.sendMessage(
+            chatId,
+            '❌ Failed to process links. Please try sending them directly to the bot in private chat.',
+            { reply_to_message_id: msg.message_id }
+          );
+          return;
+        }
+        
+        const deepLink = `https://t.me/${botInfo.username}?start=${startParam}`;
+        
         const keyboard = {
           inline_keyboard: [[
             {
               text: '▶️ Start',
-              callback_data: JSON.stringify({
-                action: 'start_process',
-                userId: msg.from.id,
-                messageId: msg.message_id
-              })
+              url: deepLink
             }
           ]]
         };
 
         await this.bot.sendMessage(
           chatId,
-          '🔗 Detected join link',
+          '🔗 Detected join link\n\nClick Start to process in private chat with the bot.',
           {
             reply_to_message_id: msg.message_id,
             reply_markup: keyboard
           }
         );
 
-        // Store the request data for later processing
-        const requestKey = `${chatId}_${msg.message_id}`;
-        if (!this.pendingRequests) {
-          this.pendingRequests = new Map();
-        }
-        
-        this.pendingRequests.set(requestKey, {
-          chatId: chatId,
-          userId: msg.from.id,
-          username: msg.from.username || 'unknown',
-          botLinks: botLinks,
-          originalMessageId: msg.message_id
-        });
-
-        this.logger.log('INFO', `Stored pending request for group chat ${chatId}, message ${msg.message_id}`);
+        this.logger.log('INFO', `Sent deep link button for group chat ${chatId}, message ${msg.message_id}`);
       } catch (error) {
         this.logger.log('ERROR', `Failed to send button message: ${error.message}`);
       }
@@ -312,6 +389,74 @@ Use /help for more information.
     }
   }
 
+  async handleCallbackQuery(query) {
+    const chatId = query.message.chat.id;
+    const userId = query.from.id;
+    
+    try {
+      const data = JSON.parse(query.data);
+      
+      if (data.action === 'start_process') {
+        // Check if the user who clicked is the same as the one who sent the message
+        if (data.userId !== userId) {
+          await this.bot.answerCallbackQuery(query.id, {
+            text: '❌ Only the person who sent the link can start the process',
+            show_alert: true
+          });
+          return;
+        }
+
+        // Retrieve the stored request
+        const requestKey = `${chatId}_${data.messageId}`;
+        if (!this.pendingRequests || !this.pendingRequests.has(requestKey)) {
+          await this.bot.answerCallbackQuery(query.id, {
+            text: '❌ Request expired or not found',
+            show_alert: true
+          });
+          return;
+        }
+
+        const storedRequest = this.pendingRequests.get(requestKey);
+        this.pendingRequests.delete(requestKey);
+
+        // Answer the callback query
+        await this.bot.answerCallbackQuery(query.id, {
+          text: '✅ Starting process...'
+        });
+
+        // Update the button message to show it's processing
+        try {
+          await this.bot.editMessageText('⏳ Processing...', {
+            chat_id: chatId,
+            message_id: query.message.message_id
+          });
+        } catch (error) {
+          this.logger.log('WARN', `Failed to edit button message: ${error.message}`);
+        }
+
+        // Create and emit the request
+        const request = {
+          chatId: chatId,
+          userId: storedRequest.userId,
+          username: storedRequest.username,
+          botLinks: storedRequest.botLinks,
+          timestamp: new Date(),
+          status: 'queued',
+          timeout: 300000 // 5 minutes
+        };
+
+        this.logger.log('INFO', `Processing ${request.botLinks.length} bot link(s) from button click by user ${userId}`);
+        this.emit('requestReceived', request);
+      }
+    } catch (error) {
+      this.logger.log('ERROR', `Error handling callback query: ${error.message}`);
+      await this.bot.answerCallbackQuery(query.id, {
+        text: '❌ An error occurred',
+        show_alert: true
+      });
+    }
+  }
+
   async handleForwardedMessage(msg) {
     // This is a forwarded message from client to bot account
     // We need to forward it to the end user who requested it
@@ -324,6 +469,86 @@ Use /help for more information.
       message: msg,
       targetBotId: forwardedFromBotId
     });
+  }
+
+  encodeLinksToParameter(botLinks) {
+    // Encode bot links into a compact base64 string
+    // Format: JSON array of {b: botUsername, s: startParameter}
+    try {
+      const compactLinks = botLinks.map(link => ({
+        b: link.botUsername,
+        s: link.startParameter
+      }));
+      
+      const jsonStr = JSON.stringify(compactLinks);
+      const base64 = Buffer.from(jsonStr).toString('base64')
+        .replace(/\+/g, '-')  // Make URL safe
+        .replace(/\//g, '_')
+        .replace(/=/g, '');   // Remove padding
+      
+      // Telegram's start parameter limit is 64 characters
+      // If we exceed this, we need to handle it
+      if (base64.length > 64) {
+        this.logger.log('WARN', `Encoded parameter length (${base64.length}) exceeds Telegram limit (64). Truncating to first link only.`);
+        
+        // Try with just the first link
+        const singleLink = [{
+          b: botLinks[0].botUsername,
+          s: botLinks[0].startParameter
+        }];
+        
+        const singleJsonStr = JSON.stringify(singleLink);
+        const singleBase64 = Buffer.from(singleJsonStr).toString('base64')
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=/g, '');
+        
+        if (singleBase64.length > 64) {
+          this.logger.log('ERROR', `Even single link exceeds parameter limit (${singleBase64.length})`);
+          return null;
+        }
+        
+        this.logger.log('INFO', `Using only first link due to parameter size limit`);
+        return singleBase64;
+      }
+      
+      this.logger.log('DEBUG', `Encoded ${botLinks.length} link(s) to parameter: ${base64.substring(0, 50)}...`);
+      return base64;
+    } catch (error) {
+      this.logger.log('ERROR', `Failed to encode links: ${error.message}`);
+      return null;
+    }
+  }
+
+  decodeStartParameter(param) {
+    // Decode base64 parameter back to bot links
+    try {
+      // Restore base64 padding and URL-safe characters
+      let base64 = param
+        .replace(/-/g, '+')
+        .replace(/_/g, '/');
+      
+      // Add padding if needed
+      while (base64.length % 4) {
+        base64 += '=';
+      }
+      
+      const jsonStr = Buffer.from(base64, 'base64').toString('utf8');
+      const compactLinks = JSON.parse(jsonStr);
+      
+      // Convert back to full format
+      const botLinks = compactLinks.map(link => ({
+        botUsername: link.b,
+        startParameter: link.s,
+        originalUrl: `https://t.me/${link.b}?start=${link.s}`
+      }));
+      
+      this.logger.log('DEBUG', `Decoded parameter to ${botLinks.length} link(s)`);
+      return { links: botLinks };
+    } catch (error) {
+      this.logger.log('ERROR', `Failed to decode parameter: ${error.message}`);
+      return null;
+    }
   }
 
   extractUrlsFromEntities(text, entities) {
@@ -364,7 +589,8 @@ Use /help for more information.
 
   async sendMessage(chatId, text, options = {}) {
     try {
-      await this.bot.sendMessage(chatId, text, options);
+      const msg = await this.bot.sendMessage(chatId, text, options);
+      return msg.message_id;
     } catch (error) {
       this.logger.log('ERROR', `Failed to send message to ${chatId}: ${error.message}`);
       throw error;
@@ -394,7 +620,8 @@ Use /help for more information.
 
   async sendPhoto(chatId, photo, options = {}) {
     try {
-      await this.bot.sendPhoto(chatId, photo, options);
+      const msg = await this.bot.sendPhoto(chatId, photo, options);
+      return msg.message_id;
     } catch (error) {
       this.logger.log('ERROR', `Failed to send photo to ${chatId}: ${error.message}`);
       throw error;
@@ -403,7 +630,8 @@ Use /help for more information.
 
   async sendVideo(chatId, video, options = {}) {
     try {
-      await this.bot.sendVideo(chatId, video, options);
+      const msg = await this.bot.sendVideo(chatId, video, options);
+      return msg.message_id;
     } catch (error) {
       this.logger.log('ERROR', `Failed to send video to ${chatId}: ${error.message}`);
       throw error;
@@ -412,7 +640,8 @@ Use /help for more information.
 
   async sendDocument(chatId, document, options = {}) {
     try {
-      await this.bot.sendDocument(chatId, document, options);
+      const msg = await this.bot.sendDocument(chatId, document, options);
+      return msg.message_id;
     } catch (error) {
       this.logger.log('ERROR', `Failed to send document to ${chatId}: ${error.message}`);
       throw error;
@@ -426,6 +655,27 @@ Use /help for more information.
     } catch (error) {
       this.logger.log('ERROR', `Failed to forward message: ${error.message}`);
       throw error;
+    }
+  }
+
+  async deleteMessage(chatId, messageId) {
+    try {
+      await this.bot.deleteMessage(chatId, messageId);
+      this.logger.log('INFO', `Deleted message ${messageId} from chat ${chatId}`);
+      return true;
+    } catch (error) {
+      this.logger.log('ERROR', `Failed to delete message: ${error.message}`);
+      return false;
+    }
+  }
+  async deleteMessage(chatId, messageId) {
+    try {
+      await this.bot.deleteMessage(chatId, messageId);
+      this.logger.log('INFO', `Deleted message ${messageId} from chat ${chatId}`);
+      return true;
+    } catch (error) {
+      this.logger.log('ERROR', `Failed to delete message: ${error.message}`);
+      return false;
     }
   }
 

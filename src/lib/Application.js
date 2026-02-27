@@ -24,6 +24,9 @@ class Application {
     this.requestQueue = null;
     this.botRequestHandler = null;
     
+    // Track media messages for auto-deletion
+    this.mediaMessageTracker = new Map(); // chatId -> { messageIds: [], warningMessageId: null }
+    
     this.client = null;
     this.isShuttingDown = false;
   }
@@ -107,6 +110,9 @@ class Application {
         }
       });
 
+      // Track media messages for auto-deletion
+      this.mediaMessageTracker = new Map(); // chatId -> { messageIds: [], warningMessageId: null }
+
       // Handle forwarded media from client to bot
       this.telegramBot.on('forwardedMediaReceived', async (data) => {
         const { message, targetBotId } = data;
@@ -115,15 +121,33 @@ class Application {
         const request = this.requestTracker.getRequest(targetBotId);
         
         if (request) {
-          this.logger.log('INFO', `Forwarding media from bot ${targetBotId} to user ${request.endUserId}`);
+          this.logger.log('INFO', `Forwarding media from bot ${targetBotId} to user ${request.endUserId} without caption`);
           
-          // Forward the message to the end user
+          // Forward the message without caption
           try {
-            await this.telegramBot.forwardMessage(
-              request.endUserChatId,
-              message.chat.id,
-              message.message_id
-            );
+            let messageId = null;
+            
+            // Use bot API to send media without caption
+            if (message.photo) {
+              const photo = message.photo[message.photo.length - 1].file_id;
+              messageId = await this.telegramBot.sendPhoto(request.endUserChatId, photo);
+            } else if (message.video) {
+              messageId = await this.telegramBot.sendVideo(request.endUserChatId, message.video.file_id);
+            } else if (message.document) {
+              messageId = await this.telegramBot.sendDocument(request.endUserChatId, message.document.file_id);
+            } else {
+              this.logger.log('WARN', `Unknown media type in message ${message.message_id}`);
+            }
+
+            // Track the sent media message ID for auto-deletion
+            if (messageId) {
+              const chatId = request.endUserChatId;
+              if (!this.mediaMessageTracker.has(chatId)) {
+                this.mediaMessageTracker.set(chatId, { messageIds: [], warningMessageId: null });
+              }
+              this.mediaMessageTracker.get(chatId).messageIds.push(messageId);
+              this.logger.log('INFO', `Tracked media message ${messageId} for auto-deletion in chat ${chatId}`);
+            }
           } catch (error) {
             this.logger.log('ERROR', `Failed to forward to end user: ${error.message}`);
           }
@@ -142,8 +166,47 @@ class Application {
         }
       });
 
-      this.requestQueue.on('requestCompleted', (request) => {
+      this.requestQueue.on('requestCompleted', async (request) => {
         this.logger.log('INFO', `Request completed for bot user ${request.userId}`);
+        
+        // Send warning and schedule auto-deletion of media messages
+        const chatId = request.chatId;
+        if (this.mediaMessageTracker.has(chatId)) {
+          const tracker = this.mediaMessageTracker.get(chatId);
+          
+          if (tracker.messageIds.length > 0) {
+            try {
+              // Send warning message
+              const warningText = '⚠️ Media will be automatically deleted in 20 seconds.';
+              const warningMessageId = await this.telegramBot.sendMessage(chatId, warningText);
+              tracker.warningMessageId = warningMessageId;
+              
+              this.logger.log('INFO', `Sent deletion warning to chat ${chatId}, scheduling deletion in 20 seconds`);
+              
+              // Schedule deletion after 20 seconds
+              setTimeout(async () => {
+                const messageIds = [...tracker.messageIds];
+                const warningId = tracker.warningMessageId;
+                
+                // Delete all media messages
+                for (const messageId of messageIds) {
+                  await this.telegramBot.deleteMessage(chatId, messageId);
+                }
+                
+                // Delete warning message
+                if (warningId) {
+                  await this.telegramBot.deleteMessage(chatId, warningId);
+                }
+                
+                // Clean up tracker
+                this.mediaMessageTracker.delete(chatId);
+                this.logger.log('INFO', `Deleted ${messageIds.length} media message(s) and warning from chat ${chatId}`);
+              }, 20000); // 20 seconds
+            } catch (error) {
+              this.logger.log('ERROR', `Failed to send warning or schedule deletion: ${error.message}`);
+            }
+          }
+        }
         
         // Clean up tracking after a delay (to allow media to arrive)
         setTimeout(() => {

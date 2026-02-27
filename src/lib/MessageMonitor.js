@@ -37,23 +37,14 @@ class MessageMonitor extends EventEmitter {
 
       const senderId = message.senderId?.toString() || 'unknown';
       const messageText = message.text;
+      const entities = message.entities || [];
       const preview = messageText.substring(0, 50) + (messageText.length > 50 ? '...' : '');
 
       // Log received message
       this.logger.log('INFO', `Message received from user:${senderId} - "${preview}"`);
 
-      // Extract URLs from message entities (hidden links)
-      const entityUrls = this.extractUrlsFromEntities(message);
-      console.log('entityUrls', entityUrls)
-      // Extract bot links from plain text
-      const textBotLinks = this.linkParser.extractBotLinks(messageText);
-      
-      // Extract bot links from entities
-      const entityBotLinks = this.linkParser.extractBotLinks(entityUrls.join(' '));
-      
-      // Combine and deduplicate
-      const allBotLinks = [...textBotLinks, ...entityBotLinks];
-      const uniqueBotLinks = this.deduplicateLinks(allBotLinks);
+      // Extract bot links from both text and entities
+      const uniqueBotLinks = this.linkParser.extractBotLinks(messageText, entities);
 
       // Emit event for each detected bot link
       for (const link of uniqueBotLinks) {
