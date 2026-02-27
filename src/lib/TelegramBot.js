@@ -198,7 +198,7 @@ Happy downloading! 🎉
   }
 
   async handleMessage(msg) {
-    // console.log('handleMessage, msg:', msg)
+    console.log('handleMessage, msg:', msg)
     // Prevent duplicate processing of the same message
     const messageKey = `${msg.chat.id}_${msg.message_id}`;
     if (this.processedMessages.has(messageKey)) {
@@ -473,15 +473,15 @@ Use /help for more information.
 
   encodeLinksToParameter(botLinks) {
     // Encode bot links into a compact base64 string
-    // Format: JSON array of {b: botUsername, s: startParameter}
+    // Format: pipe-separated values: botUsername|startParameter (for single link)
+    // For multiple links: botUsername1|startParam1||botUsername2|startParam2
     try {
-      const compactLinks = botLinks.map(link => ({
-        b: link.botUsername,
-        s: link.startParameter
-      }));
+      // Use a more compact format: pipe-separated values
+      const compactStr = botLinks.map(link => 
+        `${link.botUsername}|${link.startParameter}`
+      ).join('||');
       
-      const jsonStr = JSON.stringify(compactLinks);
-      const base64 = Buffer.from(jsonStr).toString('base64')
+      const base64 = Buffer.from(compactStr).toString('base64')
         .replace(/\+/g, '-')  // Make URL safe
         .replace(/\//g, '_')
         .replace(/=/g, '');   // Remove padding
@@ -492,13 +492,8 @@ Use /help for more information.
         this.logger.log('WARN', `Encoded parameter length (${base64.length}) exceeds Telegram limit (64). Truncating to first link only.`);
         
         // Try with just the first link
-        const singleLink = [{
-          b: botLinks[0].botUsername,
-          s: botLinks[0].startParameter
-        }];
-        
-        const singleJsonStr = JSON.stringify(singleLink);
-        const singleBase64 = Buffer.from(singleJsonStr).toString('base64')
+        const singleStr = `${botLinks[0].botUsername}|${botLinks[0].startParameter}`;
+        const singleBase64 = Buffer.from(singleStr).toString('base64')
           .replace(/\+/g, '-')
           .replace(/\//g, '_')
           .replace(/=/g, '');
@@ -522,6 +517,8 @@ Use /help for more information.
 
   decodeStartParameter(param) {
     // Decode base64 parameter back to bot links
+    // Format: pipe-separated values: botUsername|startParameter (for single link)
+    // For multiple links: botUsername1|startParam1||botUsername2|startParam2
     try {
       // Restore base64 padding and URL-safe characters
       let base64 = param
@@ -533,15 +530,18 @@ Use /help for more information.
         base64 += '=';
       }
       
-      const jsonStr = Buffer.from(base64, 'base64').toString('utf8');
-      const compactLinks = JSON.parse(jsonStr);
+      const compactStr = Buffer.from(base64, 'base64').toString('utf8');
       
-      // Convert back to full format
-      const botLinks = compactLinks.map(link => ({
-        botUsername: link.b,
-        startParameter: link.s,
-        originalUrl: `https://t.me/${link.b}?start=${link.s}`
-      }));
+      // Split by || for multiple links, then split each by | for bot and param
+      const linkParts = compactStr.split('||');
+      const botLinks = linkParts.map(part => {
+        const [botUsername, startParameter] = part.split('|');
+        return {
+          botUsername,
+          startParameter,
+          originalUrl: `https://t.me/${botUsername}?start=${startParameter}`
+        };
+      });
       
       this.logger.log('DEBUG', `Decoded parameter to ${botLinks.length} link(s)`);
       return { links: botLinks };
