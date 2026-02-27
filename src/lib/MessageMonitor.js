@@ -44,7 +44,7 @@ class MessageMonitor extends EventEmitter {
 
       // Extract URLs from message entities (hidden links)
       const entityUrls = this.extractUrlsFromEntities(message);
-      
+      console.log('entityUrls', entityUrls)
       // Extract bot links from plain text
       const textBotLinks = this.linkParser.extractBotLinks(messageText);
       

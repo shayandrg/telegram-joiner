@@ -338,7 +338,7 @@ class BotInteractionHandler extends EventEmitter {
     return new Promise((resolve) => {
       const mediaMessages = [];
       let lastMessageTime = Date.now();
-      const mediaTimeout = 10000; // 10 seconds after last media message
+      const mediaTimeout = 60000; // 60 seconds after last media message
       let mediaCount = 0;
       let retryAttempted = false;
       
